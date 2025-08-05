@@ -1,133 +1,202 @@
-import torch
-from transformers import CLIPProcessor, CLIPModel
-from PIL import Image
-import pandas as pd
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Extract individual object crops from SODA-A images using polygon annotations.
+Creates masked crops where only the target object is visible.
+"""
+
 import os
+import json
+import csv
+import cv2
 import numpy as np
+from pathlib import Path
+from collections import defaultdict
+from PIL import Image
 from tqdm import tqdm
 
-# SODA-A classes (9)
-SODA_CLASSES = [
-    "Car", "Truck", "Van", "Bus",
-    "Cyclist", "Tricycle", "Motor", "Person", "Others"
-]
+def categorize_size(rel_pct):
+    if   rel_pct < 1.0:  return 'tiny'
+    elif rel_pct < 5.0:  return 'small'
+    elif rel_pct < 15.0: return 'medium'
+    elif rel_pct < 40.0: return 'large'
+    else:               return 'huge'
 
-# Load CLIP model from Hugging Face
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model_name = "openai/clip-vit-base-patch32"  # or "openai/clip-vit-large-patch14"
-model = CLIPModel.from_pretrained(model_name).to(device)
-processor = CLIPProcessor.from_pretrained(model_name)
+def polygon_area(poly_coords):
+    """Calculate polygon area using shoelace formula."""
+    if len(poly_coords) < 6:
+        return 0
+    coords = np.array(poly_coords).reshape(-1, 2)
+    x, y = coords[:, 0], coords[:, 1]
+    n = len(coords)
+    return 0.5 * abs(sum(x[i]*y[(i+1)%n] - x[(i+1)%n]*y[i] for i in range(n)))
 
-# Configuration
-DATA_ROOT = "/data/azfarm/siddhant/ICCV/dataset/SODA-A_clip"  # update as needed
-CSV_PATH  = "/data/azfarm/siddhant/ICCV/soda_object_sizes.csv"
+def create_polygon_mask(poly_coords, img_shape):
+    """Create binary mask from polygon coordinates."""
+    if len(poly_coords) < 6:
+        return np.zeros(img_shape[:2], dtype=np.uint8)
+    
+    coords = np.array(poly_coords).reshape(-1, 2).astype(np.int32)
+    mask = np.zeros(img_shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [coords], 255)
+    return mask
 
-# Load dataset of extracted object crops
-df = pd.read_csv(CSV_PATH)
-print(f"Total samples: {len(df)}")
-print(f"Size distribution: {df['size_category'].value_counts().to_dict()}")
+def extract_object_crop(image, poly_coords, padding=10):
+    """Extract bounding box crop with polygon mask applied."""
+    if len(poly_coords) < 6:
+        return None
+    
+    coords = np.array(poly_coords).reshape(-1, 2)
+    x_coords, y_coords = coords[:, 0], coords[:, 1]
+    
+    # Get bounding box with padding
+    xmin = max(0, int(x_coords.min()) - padding)
+    ymin = max(0, int(y_coords.min()) - padding)
+    xmax = min(image.shape[1], int(x_coords.max()) + padding)
+    ymax = min(image.shape[0], int(y_coords.max()) + padding)
+    
+    if xmax <= xmin or ymax <= ymin:
+        return None
+    
+    # Crop image
+    crop = image[ymin:ymax, xmin:xmax].copy()
+    
+    # Create mask for cropped region
+    adjusted_coords = coords.copy()
+    adjusted_coords[:, 0] -= xmin
+    adjusted_coords[:, 1] -= ymin
+    
+    crop_mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(crop_mask, [adjusted_coords.astype(np.int32)], 255)
+    
+    # Apply mask (black out non-object areas)
+    crop[crop_mask == 0] = 0
+    
+    return crop
 
-# Pre-build text prompts
-text_prompts = [f"a photo of a {cls.lower()}" for cls in SODA_CLASSES]
-
-results = []
-summary = {}
-
-for size_category, group in df.groupby('size_category'):
-    print(f"\nEvaluating {size_category} objects ({len(group)} samples)...")
-    correct1 = 0
-    correct5 = 0
-    total_conf = 0.0
-    preds = []
-
-    batch_size = 32
-    for start in tqdm(range(0, len(group), batch_size), desc=size_category):
-        batch = group.iloc[start:start+batch_size]
-        images = []
-        true_labels = []
-        valid_idxs = []
-
-        # Load images
-        for i, (_, row) in enumerate(batch.iterrows()):
-            img_path = row['object_image_path']
-            if os.path.exists(img_path):
-                try:
-                    img = Image.open(img_path).convert('RGB')
-                    images.append(img)
-                    true_labels.append(row['class_name'])
-                    valid_idxs.append(i)
-                except:
-                    continue
-
-        if not images:
+def process_soda_annotations(images_dir, ann_root, output_dir):
+    """Extract object crops from SODA-A annotations."""
+    images_dir = Path(images_dir)
+    ann_root = Path(ann_root)
+    output_dir = Path(output_dir)
+    
+    # SODA-A class mapping
+    SODA_CLASSES = [
+        "Car", "Truck", "Van", "Bus",
+        "Cyclist", "Tricycle", "Motor", "Person", "Others"
+    ]
+    
+    all_records = []
+    
+    for split in ['train', 'val', 'test']:
+        ann_dir = ann_root / split
+        if not ann_dir.exists():
             continue
-
-        # Process batch with CLIP
-        inputs = processor(text=text_prompts,
-                           images=images,
-                           return_tensors="pt",
-                           padding=True,
-                           truncation=True).to(device)
-        with torch.no_grad():
-            outputs = model(**inputs)
-            logits = outputs.logits_per_image  # [B, 9]
-            probs = torch.softmax(logits, dim=1).cpu().numpy()
-
-        # Evaluate predictions
-        for idx, prob_vec in enumerate(probs):
-            true_cls = true_labels[idx]
-            if true_cls not in SODA_CLASSES:
+            
+        split_output_dir = output_dir / f"{split}_crops"
+        split_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        json_files = list(ann_dir.glob("*.json"))
+        print(f"Processing {split}: {len(json_files)} images")
+        
+        for json_file in tqdm(json_files, desc=f"Extracting {split}"):
+            try:
+                # Load annotation
+                with open(json_file) as f:
+                    data = json.load(f)
+                
+                image_id = json_file.stem
+                img_path = images_dir / f"{image_id}.jpg"
+                
+                if not img_path.exists():
+                    continue
+                
+                # Load image
+                image = cv2.imread(str(img_path))
+                if image is None:
+                    continue
+                
+                h, w = image.shape[:2]
+                img_area = h * w
+                
+                # Process each object
+                objects = data.get('objects', data.get('annotations', []))
+                
+                for obj_idx, obj in enumerate(objects):
+                    try:
+                        # Get polygon and class
+                        poly_coords = obj.get('poly', [])
+                        if len(poly_coords) < 6:
+                            continue
+                        
+                        cls_id = obj.get('category_id', 0)
+                        cls_name = SODA_CLASSES[cls_id] if cls_id < len(SODA_CLASSES) else "Unknown"
+                        
+                        # Calculate size category
+                        area = polygon_area(poly_coords)
+                        rel_pct = (area / img_area) * 100
+                        size_cat = categorize_size(rel_pct)
+                        
+                        # Extract object crop
+                        crop = extract_object_crop(image, poly_coords)
+                        if crop is None or crop.size == 0:
+                            continue
+                        
+                        # Save crop
+                        crop_filename = f"{image_id}_{obj_idx:02d}_{cls_name}_{size_cat}.jpg"
+                        crop_path = split_output_dir / crop_filename
+                        cv2.imwrite(str(crop_path), crop)
+                        
+                        # Record metadata
+                        all_records.append({
+                            'original_image_id': image_id,
+                            'object_image_filename': crop_filename,
+                            'object_image_path': str(crop_path),
+                            'split': split,
+                            'class_id': cls_id,
+                            'class_name': cls_name,
+                            'size_category': size_cat,
+                            'poly_area': area,
+                            'relative_area_percent': round(rel_pct, 3)
+                        })
+                        
+                    except Exception as e:
+                        continue
+                        
+            except Exception as e:
                 continue
-            true_idx = SODA_CLASSES.index(true_cls)
+    
+    # Save metadata CSV
+    csv_path = output_dir / "soda_individual_objects.csv"
+    if all_records:
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=list(all_records[0].keys()))
+            writer.writeheader()
+            writer.writerows(all_records)
+    
+    print(f"\n✅ Extracted {len(all_records)} object crops")
+    print(f"📄 Metadata saved to: {csv_path}")
+    
+    # Show statistics
+    if all_records:
+        from collections import Counter
+        size_dist = Counter(r['size_category'] for r in all_records)
+        class_dist = Counter(r['class_name'] for r in all_records)
+        
+        print(f"\n📊 Size distribution: {dict(size_dist)}")
+        print(f"🏷️  Class distribution: {dict(class_dist.most_common(5))}")
+    
+    return csv_path
 
-            top5_idx = np.argsort(prob_vec)[-5:][::-1]
-            top1_idx = top5_idx[0]
-            conf = float(prob_vec[true_idx])
+if __name__ == "__main__":
+    # Configuration
+    IMAGES_DIR = "/home/wirin/Ashish/VLM/data/Images"
+    ANN_ROOT = "/home/wirin/Ashish/VLM/data/Annotations"
+    OUTPUT_DIR = "/home/wirin/Ashish/VLM/data/soda_object_crops"
+    
+    print("🚀 Starting SODA-A object extraction...")
+    csv_path = process_soda_annotations(IMAGES_DIR, ANN_ROOT, OUTPUT_DIR)
+    print(f"✅ Complete! Now run CLIP evaluation with: {csv_path}")
 
-            correct1 += int(top1_idx == true_idx)
-            correct5 += int(true_idx in top5_idx)
-            total_conf += conf
 
-            preds.append({
-                'image_id': batch.iloc[valid_idxs[idx]]['original_image_id'],
-                'filename': batch.iloc[valid_idxs[idx]]['object_image_filename'],
-                'size_category': size_category,
-                'true_class': true_cls,
-                'pred_class': SODA_CLASSES[top1_idx],
-                'confidence': conf,
-                'top1_correct': top1_idx == true_idx,
-                'top5_correct': true_idx in top5_idx,
-                'top5_classes': [SODA_CLASSES[i] for i in top5_idx],
-                'top5_probs': prob_vec[top5_idx].tolist()
-            })
 
-    n = len(preds)
-    if n > 0:
-        summary[size_category] = {
-            'samples': n,
-            'top1_accuracy': correct1 / n,
-            'top5_accuracy': correct5 / n,
-            'mean_confidence': total_conf / n
-        }
-        print(f"{size_category.capitalize()} → N={n}, Top-1={summary[size_category]['top1_accuracy']:.3f}, "
-              f"Top-5={summary[size_category]['top5_accuracy']:.3f}, "
-              f"MeanConf={summary[size_category]['mean_confidence']:.3f}")
-
-    results.extend(preds)
-
-# Final summary display
-print("\n" + "="*40)
-print("RESULTS BY SIZE CATEGORY")
-for sz in ['tiny','small','medium','large','huge']:
-    if sz in summary:
-        m = summary[sz]
-        print(f"{sz.upper():>6}: Top-1={m['top1_accuracy']:.3f}, Top-5={m['top5_accuracy']:.3f}, N={m['samples']}")
-
-# Save detailed and summary CSVs
-pd.DataFrame(results).to_csv('clip_soda_detailed.csv', index=False)
-pd.DataFrame([
-    {'size_category': sz, **metrics}
-    for sz, metrics in summary.items()
-]).to_csv('clip_soda_summary.csv', index=False)
-
-print("\nSaved clip_soda_detailed.csv and clip_soda_summary.csv")

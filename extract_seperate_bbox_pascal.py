@@ -1,153 +1,225 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Extract and mask individual objects from SODA-A images.
-For each JSON annotation (one per image) in train/val/test, 
-produce masked crops where only the target object is visible.
-Also generate a CSV metadata file.
-"""
 
-import os
-import json
-import csv
-import cv2
-import numpy as np
+import os, json, csv
 from pathlib import Path
 from collections import defaultdict
 from PIL import Image
+import numpy as np
 
-def categorize_size(relative_area_percent):
-    """Categorize object size based on relative area percentage"""
-    if relative_area_percent < 1.0:
-        return 'tiny'
-    elif relative_area_percent < 5.0:
-        return 'small'
-    elif relative_area_percent < 15.0:
-        return 'medium'
-    elif relative_area_percent < 40.0:
-        return 'large'
-    else:
-        return 'huge'
+def categorize_size(rel_pct):
+    if   rel_pct < 1.0:  return 'tiny'
+    elif rel_pct < 5.0:  return 'small'
+    elif rel_pct < 15.0: return 'medium'
+    elif rel_pct < 40.0: return 'large'
+    else:               return 'huge'
 
-def parse_soda_annotation(json_path, img_dir):
-    """
-    Parse one SODA-A JSON. Returns:
-      image_id, filename, img_width, img_height, list of objects dicts with:
-      class_name, bbox (rotated box), axis-aligned bbox, area, rel_area, size_category, idx
-    """
-    with open(json_path, 'r', encoding='utf-8') as f:
+def poly_to_bbox_area(poly):
+    """Convert polygon to bounding box and calculate area."""
+    if len(poly) < 6:  # Need at least 3 points
+        return 0, (0,0,0,0)
+    
+    coords = np.array(poly).reshape(-1, 2)
+    x_coords = coords[:, 0]
+    y_coords = coords[:, 1]
+    
+    # Bounding box
+    xmin, xmax = x_coords.min(), x_coords.max()
+    ymin, ymax = y_coords.min(), y_coords.max()
+    bbox = (int(xmin), int(ymin), int(xmax), int(ymax))
+    
+    # Polygon area using shoelace formula
+    n = len(coords)
+    area = 0.5 * abs(sum(x_coords[i]*y_coords[(i+1)%n] - x_coords[(i+1)%n]*y_coords[i] 
+                        for i in range(n)))
+    
+    return area, bbox
+
+def parse_soda_json(json_path, img_dir):
+    """Parse SODA-A JSON with polygon annotations."""
+    with open(json_path, 'r') as f:
         data = json.load(f)
-
+    
     image_id = Path(json_path).stem
-    filename = f"{image_id}.jpg"
-    img_path = img_dir / filename
+    img_path = img_dir / f"{image_id}.jpg"
+    
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {img_path}")
-
+    
     w, h = Image.open(img_path).size
     img_area = w * h
-
+    
     objects = []
-    for idx, obj in enumerate(data.get('objects', [])):
-        cls = data['categories'][obj['category_id']] if 'categories' in data else str(obj['category_id'])
-        cx, cy, bw, bh, _ = obj['bbox']
-        # axis-aligned bounding box (xmin,ymin,xmax,ymax)
-        xmin = int(cx - bw/2)
-        ymin = int(cy - bh/2)
-        xmax = int(cx + bw/2)
-        ymax = int(cy + bh/2)
-        bbox_area = bw * bh
-        rel_pct = bbox_area / img_area * 100
-        size_cat = categorize_size(rel_pct)
-        objects.append({
-            'class_name': cls,
-            'bbox_rot': (cx, cy, bw, bh),
-            'bbox': (xmin, ymin, xmax, ymax),
-            'bbox_area': bbox_area,
-            'relative_area_percent': rel_pct,
-            'size_category': size_cat,
-            'object_idx': idx
-        })
-    return image_id, filename, w, h, objects
-
-def create_masked_image(image_path, target_bbox, all_bboxes):
-    """Return image with only target_bbox visible; others blacked-out."""
-    img = cv2.imread(str(image_path))
-    if img is None:
-        raise ValueError(f"Cannot load image: {image_path}")
-    masked = np.zeros_like(img)
-    xmin, ymin, xmax, ymax = target_bbox
-    masked[ymin:ymax, xmin:xmax] = img[ymin:ymax, xmin:xmax]
-    return masked
-
-def extract_and_process_soda(images_dir, annotations_root, output_root):
-    """
-    For each split (train/val/test) under annotations_root:
-      - parse JSONs
-      - mask and save each object crop
-      - record metadata
-    """
-    output_root = Path(output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
-    all_records = []
-
-    for split in ['train', 'val', 'test']:
-        ann_dir = Path(annotations_root) / split
-        if not ann_dir.exists():
-            print(f"Skipping missing split: {split}")
-            continue
-        img_dir = Path(images_dir)
-        out_dir = output_root / f"{split}_objects"
-        out_dir.mkdir(exist_ok=True)
-        print(f"Processing split '{split}' with {len(list(ann_dir.glob('*.json')))} annotations")
-
-        for jf in ann_dir.glob("*.json"):
-            try:
-                img_id, fn, w, h, objs = parse_soda_annotation(jf, img_dir)
-            except Exception as e:
-                print(f"⚠️  Skip {jf.name}: {e}")
+    
+    # Handle different JSON structures
+    if 'objects' in data:
+        objs_list = data['objects']
+    elif 'annotations' in data:
+        objs_list = data['annotations']
+    else:
+        return image_id, []
+    
+    for idx, obj in enumerate(objs_list):
+        try:
+            # Get polygon coordinates
+            if 'poly' not in obj:
                 continue
+            
+            poly = obj['poly']
+            if not poly or len(poly) < 6:
+                continue
+            
+            # Get class ID
+            class_id = obj.get('category_id', obj.get('class_id', 0))
+            
+            # Convert polygon to area and bbox
+            poly_area, bbox = poly_to_bbox_area(poly)
+            
+            if poly_area == 0:
+                continue
+            
+            rel_pct = poly_area / img_area * 100
+            
+            objects.append({
+                'object_idx': idx,
+                'class_id': class_id,
+                'bbox': bbox,
+                'poly_area': poly_area,
+                'size_cat': categorize_size(rel_pct),
+                'rel_pct': rel_pct
+            })
+            
+        except Exception as e:
+            continue
+    
+    return image_id, objects
 
-            img_path = img_dir / fn
-            bboxes = [o['bbox'] for o in objs]
+def find_annotation_structure(ann_root):
+    """Auto-detect SODA-A annotation structure."""
+    ann_root = Path(ann_root)
+    
+    # Check for train/val/test subdirs
+    if all((ann_root / split).exists() for split in ['train', 'val', 'test']):
+        return 'split'
+    
+    # Check for flat structure with all JSONs
+    json_files = list(ann_root.glob("*.json"))
+    if json_files:
+        return 'flat'
+    
+    # Check for other common structures
+    subdirs = [d.name for d in ann_root.iterdir() if d.is_dir()]
+    if subdirs:
+        return subdirs
+    
+    return None
 
-            for o in objs:
-                fname = f"{img_id}_{o['object_idx']}_{o['class_name']}_{o['size_category']}.jpg"
-                save_path = out_dir / fname
-                masked = create_masked_image(img_path, o['bbox'], bboxes)
-                cv2.imwrite(str(save_path), masked)
-
-                all_records.append({
-                    'image_id': img_id,
-                    'split': split,
-                    'object_idx': o['object_idx'],
-                    'class_name': o['class_name'],
-                    'size_category': o['size_category'],
-                    'bbox_coords': f"{o['bbox'][0]},{o['bbox'][1]},{o['bbox'][2]},{o['bbox'][3]}",
-                    'relative_area_percent': round(o['relative_area_percent'],2),
-                    'object_image_path': str(save_path)
-                })
-
-    # write CSV
-    csv_path = output_root / "soda_individual_objects.csv"
-    with open(csv_path, 'w', newline='', encoding='utf-8') as cf:
-        writer = csv.DictWriter(cf, fieldnames=list(all_records[0].keys()))
+def extract_and_process_soda(images_dir, ann_root, output_dir):
+    images_dir = Path(images_dir)
+    ann_root = Path(ann_root)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+    
+    print(f"🔍 Checking annotation structure in: {ann_root}")
+    structure = find_annotation_structure(ann_root)
+    print(f"📁 Found structure: {structure}")
+    
+    all_records = []
+    error_count = 0
+    success_count = 0
+    
+    if structure == 'split':
+        splits = ['train', 'val', 'test']
+    elif structure == 'flat':
+        splits = ['.']  # Process all JSONs in ann_root directly
+    elif isinstance(structure, list):
+        splits = structure
+    else:
+        print(f"❌ No annotations found in {ann_root}")
+        return None
+    
+    for split in splits:
+        ann_dir = ann_root if split == '.' else ann_root / split
+        
+        if not ann_dir.exists():
+            print(f"⚠️ Split {split} not found")
+            continue
+            
+        json_files = list(ann_dir.glob("*.json"))
+        print(f"📂 Processing {split}: {len(json_files)} JSONs")
+        
+        if not json_files:
+            continue
+        
+        for jf in json_files:
+            try:
+                image_id, objs = parse_soda_json(jf, images_dir)
+                if not objs:
+                    error_count += 1
+                    continue
+                    
+                success_count += 1
+                
+                # Group by class_id and pick largest instance
+                by_cls = defaultdict(list)
+                for o in objs:
+                    by_cls[o['class_id']].append(o)
+                
+                for cls_id, insts in by_cls.items():
+                    largest = max(insts, key=lambda x: x['poly_area'])
+                    rec = {
+                        'image_id': image_id,
+                        'split': split if split != '.' else 'all',
+                        'class_id': cls_id,
+                        'size_category': largest['size_cat'],
+                        'poly_area': largest['poly_area'],
+                        'relative_pct': round(largest['rel_pct'], 2)
+                    }
+                    all_records.append(rec)
+                    
+            except Exception as e:
+                error_count += 1
+                if error_count <= 5:
+                    print(f"⚠️ Error processing {jf.name}: {e}")
+    
+    print(f"✅ Successfully processed: {success_count} files")
+    print(f"❌ Errors: {error_count} files")
+    
+    # Write CSV
+    out_csv = output_dir / "soda_object_sizes.csv"
+    keys = ['image_id', 'split', 'class_id', 'size_category', 'poly_area', 'relative_pct']
+    
+    with open(out_csv, 'w', newline='') as cf:
+        writer = csv.DictWriter(cf, fieldnames=keys)
         writer.writeheader()
-        for rec in all_records:
-            writer.writerow(rec)
-
-    print(f"\n✅  Saved {len(all_records)} object images under '{output_root}'")
-    print(f"Metadata CSV: {csv_path}")
-    return csv_path
+        for r in all_records:
+            writer.writerow(r)
+    
+    print(f"📄 Wrote {len(all_records)} rows to {out_csv}")
+    
+    if len(all_records) > 0:
+        print("\n📊 Sample records:")
+        for r in all_records[:3]:
+            print(f"  {r}")
+        
+        # Show class distribution
+        from collections import Counter
+        class_dist = Counter(r['class_id'] for r in all_records)
+        size_dist = Counter(r['size_category'] for r in all_records)
+        print(f"\n📈 Class distribution: {dict(class_dist.most_common(5))}")
+        print(f"📏 Size distribution: {dict(size_dist)}")
+    
+    return out_csv
 
 if __name__ == "__main__":
-    DATA_ROOT   = "/home/rohit/Downloads/ScaleVLM-master/data"
-    IMAGES_DIR  = f"{DATA_ROOT}/images"
-    ANNS_ROOT   = f"{DATA_ROOT}/annotations"
-    OUT_ROOT    = f"{DATA_ROOT}/soda_extracted_objects"
-
-    csv_metadata = extract_and_process_soda(IMAGES_DIR, ANNS_ROOT, OUT_ROOT)
-
-    # Example: load the CSV for further use (e.g. CLIP benchmarking)
-    # import pandas as pd
-    # df = pd.read_csv(csv_metadata)
+    # Update these paths to match your actual directory structure
+    IMG_DIR = "/home/wirin/Ashish/VLM/data/Images"  # Where your .jpg files are
+    ANN_ROOT = "/home/wirin/Ashish/VLM/data/Annotations"  # Where your .json files are
+    OUTPUT_DIR = "/home/wirin/Ashish/VLM/output"
+    
+    # Print current working directory for debugging
+    print(f"🏠 Current directory: {os.getcwd()}")
+    print(f"📁 Looking for images in: {IMG_DIR}")
+    print(f"📄 Looking for annotations in: {ANN_ROOT}")
+    
+    extract_and_process_soda(IMG_DIR, ANN_ROOT, OUTPUT_DIR)
